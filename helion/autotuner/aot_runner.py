@@ -649,10 +649,11 @@ Examples:
     parser.add_argument(
         "--backend",
         type=str,
-        choices=["decision_tree", "nearest_neighbor"],
+        choices=["decision_tree", "nearest_neighbor", "ranker"],
         default="decision_tree",
         help="Heuristic generation backend (default: decision_tree). "
-        "nearest_neighbor stores all training shapes and finds closest match at runtime.",
+        "nearest_neighbor stores all training shapes and finds closest match at runtime. "
+        "ranker (experimental) adds a fallback config ranker trained on collect data.",
     )
 
     parser.add_argument(

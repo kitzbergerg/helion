@@ -51,9 +51,11 @@ from .benchmark_provider import _MultiShapeAutotuneArgs
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from types import ModuleType
     from typing import Callable
 
     from .base_search import BaseSearch
+    from helion.autotuner.benchmark_provider import BenchmarkResult
 
 log: logging.Logger = logging.getLogger(__name__)
 
@@ -295,6 +297,15 @@ class AOTAutotuneCache(AutotuneCacheBase):
     # Maps (kernel_source_file, kernel_name, shape_features_hash) -> Config
     # Using source file ensures kernels with same name in different modules don't collide
     _heuristic_results: ClassVar[dict[tuple[str, str, str], Config]] = {}
+    # Experimental (ranker backend): fallback configs to try if the heuristic
+    # config fails to launch. Same key as _heuristic_results. Used as a side
+    # channel because BoundKernel never retains the cache object.
+    _fallback_configs: ClassVar[dict[tuple[str, str, str], list[Config]]] = {}
+    # The key most recently resolved by _get_heuristic_config. BoundKernel is
+    # keyed on the heuristic's config index, so one BoundKernel is shared by
+    # many shapes; set_config must read the fallbacks for the shape that just
+    # resolved, not any entry that happens to name this kernel.
+    _last_fallback_key: ClassVar[tuple[str, str, str] | None] = None
     # Tracks which kernels have shown the "no heuristic" warning (to avoid spam)
     _no_heuristic_warned: ClassVar[set[str]] = set()
     # Tracks which kernels have already been compiled in compile mode
@@ -314,6 +325,8 @@ class AOTAutotuneCache(AutotuneCacheBase):
         """Clear all class-level caches (heuristic modules and results)."""
         cls._heuristic_modules.clear()
         cls._heuristic_results.clear()
+        cls._fallback_configs.clear()
+        cls._last_fallback_key = None
         cls._no_heuristic_warned.clear()
         cls._compiled_kernels.clear()
         with cls._compiled_kernel_variants_lock:
@@ -372,6 +385,10 @@ class AOTAutotuneCache(AutotuneCacheBase):
     @property
     def _measurements_file(self) -> Path:
         """Path to the measurements CSV file."""
+        if self.mode == "collect" and os.environ.get(
+            "HELION_COLLECT_ALL_MEASUREMENTS", False
+        ):
+            return self.data_dir / "measurements_collect.csv"
         return self.data_dir / f"measurements_{self.hardware_id}.csv"
 
     def _load_tuned_configs(self) -> dict[str, list[TunedConfig]]:
@@ -483,8 +500,14 @@ class AOTAutotuneCache(AutotuneCacheBase):
         config: Config,
         timing_ms: float,
         shape_features: dict[str, Any],
+        status: str = "ok",
     ) -> None:
-        """Save a measurement to CSV."""
+        """Save a measurement to CSV.
+
+        ``status`` is the :class:`BenchmarkResult` status. It distinguishes a
+        genuine launch failure from one that never launched (``filtered``,
+        ``timeout``), which otherwise both appear as ``timing_ms == inf``.
+        """
         config_hash = hashlib.sha256(
             json.dumps(dict(config), sort_keys=True).encode()
         ).hexdigest()[:16]
@@ -495,6 +518,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
             "config": json.dumps(dict(config)),
             "shape_features": json.dumps(shape_features),
             "timing_ms": timing_ms,
+            "status": status,
         }
         file_exists = self._measurements_file.exists()
         with open(self._measurements_file, "a", newline="") as f:
@@ -756,6 +780,11 @@ class AOTAutotuneCache(AutotuneCacheBase):
             log.debug(
                 f"Using cached heuristic result for {kernel_name} shape={shape_hash}"
             )
+            # Point the fallback slot at this shape before returning: the
+            # fallbacks were computed on the first resolve of this shape and are
+            # still valid, but set_config has no other way to find them.
+            if cache_key in AOTAutotuneCache._fallback_configs:
+                AOTAutotuneCache._last_fallback_key = cache_key
             return AOTAutotuneCache._heuristic_results[cache_key]
 
         try:
@@ -777,17 +806,13 @@ class AOTAutotuneCache(AutotuneCacheBase):
             # If there's a user key, we need to pass flattened key values, not raw args
             config: Config | None = None
             autotune_fn = getattr(module, f"autotune_{kernel_name}", None)
+            heuristic_args: Sequence[object] = args
+            user_key = getattr(self.kernel.kernel, "_aot_user_key", None)
+            if user_key is not None:
+                # User key: pass flattened key values to heuristic
+                heuristic_args = _flatten_key_value(user_key(*args))
             if autotune_fn is not None:
-                user_key = getattr(self.kernel.kernel, "_aot_user_key", None)
-                if user_key is not None:
-                    # User key: pass flattened key values to heuristic
-                    key_value = user_key(*args)
-                    flat_key = _flatten_key_value(key_value)
-                    config_dict = autotune_fn(*flat_key)
-                else:
-                    # No user key: pass raw args to heuristic
-                    config_dict = autotune_fn(*args)
-                config = Config(**config_dict)
+                config = Config(**autotune_fn(*heuristic_args))
 
             # Cache the result
             if config is not None:
@@ -796,11 +821,47 @@ class AOTAutotuneCache(AutotuneCacheBase):
                     f"Cached heuristic result for {kernel_name} shape={shape_hash}"
                 )
 
+            # Experimental (ranker backend): stash ranked fallback configs for
+            # BoundKernel.set_config to retry with if this config fails to
+            # launch. Absent from every heuristic built by other backends.
+            self._maybe_cache_fallbacks(module, kernel_name, cache_key, heuristic_args)
+
             return config
         except Exception as e:
             log.warning(f"Failed to load heuristic from {heuristic_file}: {e}")
 
         return None
+
+    def _maybe_cache_fallbacks(
+        self,
+        module: ModuleType,
+        kernel_name: str,
+        cache_key: tuple[str, str, str],
+        heuristic_args: Sequence[object],
+    ) -> None:
+        """Cache ranked fallback configs from an experimental ranker heuristic.
+
+        No-op unless the heuristic was built with ``--backend ranker`` (so all
+        previously shipped heuristic files take the ``None`` path) and
+        ``HELION_AOT_RANKER_FALLBACK`` requests candidates.
+        """
+        n = int(os.environ.get("HELION_AOT_RANKER_FALLBACK", 0) or 0)
+        if n <= 0:
+            return
+        if cache_key in AOTAutotuneCache._fallback_configs:
+            AOTAutotuneCache._last_fallback_key = cache_key
+            return
+        fallbacks_fn = getattr(module, f"fallbacks_{kernel_name}", None)
+        if fallbacks_fn is None:
+            return
+        try:
+            configs = [Config(**c) for c in fallbacks_fn(*heuristic_args, n=n)]
+        except Exception as e:
+            log.warning(f"Ranker fallbacks unavailable for {kernel_name}: {e}")
+            return
+        AOTAutotuneCache._fallback_configs[cache_key] = configs
+        AOTAutotuneCache._last_fallback_key = cache_key
+        log.debug(f"Cached {len(configs)} ranker fallbacks for {kernel_name}")
 
     def _maybe_run_compile(self) -> None:
         """
@@ -1123,6 +1184,8 @@ class AOTAutotuneCache(AutotuneCacheBase):
         self._maybe_run_input_fn_workflows()
 
         if self.mode == "collect":
+            if os.environ.get("HELION_COLLECT_ALL_MEASUREMENTS", False):
+                self._attach_measurement_hook(self.autotuner)
             # Collect mode: autotune this shape and save + return the config
             return super().autotune(skip_cache=skip_cache)
 
@@ -1142,6 +1205,30 @@ class AOTAutotuneCache(AutotuneCacheBase):
         # Use parent implementation for other modes
         # Note: super().autotune() internally calls self.put() before returning
         return super().autotune(skip_cache=skip_cache)
+
+    def _attach_measurement_hook(self, search: BaseSearch) -> None:
+        """Attach a hook to on_benchmark which saves all benchmark results instead of just winning configs."""
+        kernel_name = self.kernel.kernel.name
+        shape_key = self.shape_key
+        shape_hash = shape_key.stable_hash()[:8]
+        shape_features = self._extract_shape_features()
+
+        def _callback(results: list[BenchmarkResult]) -> None:
+            for r in results:
+                self._save_measurement(
+                    kernel_name=kernel_name,
+                    shape_key=shape_key,
+                    config=r.config,
+                    timing_ms=r.perf,
+                    shape_features=shape_features,
+                    status=r.status,
+                )
+
+        search.on_benchmark = _callback
+        log.debug(
+            f"AOT collect: measurement hook attached for kernel={kernel_name} "
+            f"shape_hash={shape_hash}"
+        )
 
 
 def _serialize_value(val: object) -> object:

@@ -37,6 +37,8 @@ from typing import Literal
 import numpy as np
 
 from ..runtime.config import Config
+from .benchmark_provider import _SUCCESSFUL_BENCHMARK_STATUSES
+from .benchmark_provider import _benchmark_status_succeeded
 
 log: logging.Logger = logging.getLogger(__name__)
 
@@ -69,6 +71,10 @@ class ShapeConfigData:
     selected_config_indices: list[int] | None = (
         None  # Which configs were selected (set during heuristic generation)
     )
+    # Raw collect-phase rows, used only by the experimental ranker backend.
+    # One row per real observation, so failures stay distinguishable from
+    # unmeasured pairs (which `timings` fills with inf).
+    collect_rows: list[dict[str, Any]] | None = None
 
 
 @dataclass
@@ -268,6 +274,11 @@ def _ensure_backends_loaded() -> None:
         from .nearest_neighbor_backend import NearestNeighborBackend
 
         HEURISTIC_BACKENDS["nearest_neighbor"] = NearestNeighborBackend
+
+    if "ranker" not in HEURISTIC_BACKENDS:
+        from .ranker_backend import RankerBackend
+
+        HEURISTIC_BACKENDS["ranker"] = RankerBackend
 
 
 def get_backend(name: str, **kwargs: int) -> HeuristicBackend:
@@ -585,6 +596,60 @@ def compute_validity_partitions(
 # ============================================================================
 
 
+# Statuses that reflect an actual kernel launch, so they can be labelled as
+# robust/not-robust. Everything else in BenchmarkResult.status ("filtered",
+# "timeout", "peer_compilation_fail") failed before or around the launch and
+# says nothing about whether the config fits the device.
+_LAUNCH_OUTCOME_STATUSES = _SUCCESSFUL_BENCHMARK_STATUSES | {"error"}
+
+
+def load_collect_rows(
+    measurements_file: Path, kernel_name: str | None = None
+) -> dict[str, list[dict[str, Any]]]:
+    """Load collect-phase measurements as raw per-observation rows.
+
+    Unlike :func:`load_measurements`, this keeps one row per real measurement
+    rather than a dense matrix, so a failed config (``timing_ms == inf``) stays
+    distinguishable from a pair that was never measured. Used by the
+    experimental ranker backend to train its robustness classifier.
+
+    The ``status`` column is optional: older CSVs predate it, so success falls
+    back to a finite timing.
+    """
+    if not measurements_file.exists():
+        return {}
+
+    rows: dict[str, list[dict[str, Any]]] = {}
+    with open(measurements_file, newline="") as f:
+        for row in csv.DictReader(f):
+            kname = row["kernel_name"]
+            if kernel_name is not None and kname != kernel_name:
+                continue
+            timing = float(row["timing_ms"])
+            status = row.get("status") or ""
+            # Only a status that means "this config was launched and it failed"
+            # is a negative example. `filtered`/`timeout`/`peer_compilation_fail`
+            # never reached a launch, so they carry no robustness signal and are
+            # dropped rather than mislabelled.
+            if status:
+                if status not in _LAUNCH_OUTCOME_STATUSES:
+                    continue
+                ok = _benchmark_status_succeeded(status)
+            else:
+                ok = bool(np.isfinite(timing))
+            rows.setdefault(kname, []).append(
+                {
+                    "shape_hash": row["shape_hash"],
+                    "config_hash": row["config_hash"],
+                    "config": json.loads(row["config"]),
+                    "shape_features": json.loads(row["shape_features"]),
+                    "timing_ms": timing,
+                    "ok": ok,
+                }
+            )
+    return rows
+
+
 def load_measurements(
     measurements_file: Path, kernel_name: str | None = None
 ) -> dict[str, ShapeConfigData]:
@@ -891,6 +956,20 @@ def generate_heuristic(
     # Load measurements
     all_data = load_measurements(measurements_file, kernel_name)
     results: dict[str, HeuristicResult] = {}
+
+    # The experimental ranker backend additionally needs the sparse
+    # collect-phase rows (the dense measure matrices contain no failures).
+    if target.backend == "ranker":
+        collect_file = measurements_file.parent / "measurements_collect.csv"
+        collect_rows = load_collect_rows(collect_file, kernel_name)
+        if not collect_rows:
+            log.warning(
+                f"Ranker backend: no collect measurements at {collect_file}; "
+                "re-run collect with HELION_COLLECT_ALL_MEASUREMENTS=1"
+            )
+        for kname, rows in collect_rows.items():
+            if kname in all_data:
+                all_data[kname].collect_rows = rows
 
     # Get device info for naming heuristic files
     hw = get_hardware_info()

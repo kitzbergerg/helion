@@ -277,6 +277,7 @@ class BaseSearch(BaseAutotuner):
         self._pinned_finalist_configs: set[Config] = set()
         self._pinned_finalist_members: dict[Config, PopulationMember] = {}
         self._search_space_tracker: SearchSpaceTracker | None = None
+        self.on_benchmark: Callable[[list[BenchmarkResult]], None] | None = None
 
     @property
     def performance_unit(self) -> Literal["ms", "ratio"]:
@@ -582,6 +583,9 @@ class BaseSearch(BaseAutotuner):
         for r in results:
             if r.perf < self.best_perf_so_far:
                 self.best_perf_so_far = r.perf
+
+        if self.on_benchmark is not None:
+            self.on_benchmark(results)
 
         return results
 

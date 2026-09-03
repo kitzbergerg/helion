@@ -2226,11 +2226,78 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             config: The configuration to set.
         """
         config = self._normalize_config(config)
-        self._run = self.compile_config(config)
+        run = self.compile_config(config)
+        fallbacks = self._ranker_fallback_configs(config)
+        if fallbacks:
+            run = self._run_with_fallbacks(run, fallbacks)
+        self._run = run
         self._config = config
         counters["best_config_decorator"][
             self.format_kernel_decorator(config, self.settings)
         ] = 1
+
+    def _ranker_fallback_configs(self, config: Config) -> list[Config]:
+        """Fallback configs from an experimental ranker heuristic, if enabled.
+
+        Gated on ``HELION_AOT_RANKER_FALLBACK``; returns ``[]`` when the env var
+        is unset, so the default path is unchanged.
+        """
+        if not int(os.environ.get("HELION_AOT_RANKER_FALLBACK", 0) or 0):
+            return []
+        from ..autotuner.aot_cache import AOTAutotuneCache
+
+        key = AOTAutotuneCache._last_fallback_key
+        if key is None:
+            return []
+        # One BoundKernel is shared by every shape mapping to the same heuristic
+        # config index, so the fallbacks must come from the shape that resolved
+        # last rather than from any entry naming this kernel.
+        if key[:2] != (self.kernel.fn.__code__.co_filename, self.kernel.name):
+            return []
+        return [c for c in AOTAutotuneCache._fallback_configs[key] if c != config]
+
+    def _run_with_fallbacks(
+        self, run: CompiledConfig, fallbacks: list[Config]
+    ) -> CompiledConfig:
+        """Wrap ``run`` to retry with ranked ``fallbacks`` on a launch failure.
+
+        Candidates are compiled lazily inside the handler, so an enabled but
+        never-triggered fallback costs nothing on the success path.
+        """
+
+        from ..autotuner.logger import match_launch_resource_error
+
+        def run_with_fallbacks(*args: object) -> object:
+            try:
+                return run(*args)
+            except Exception as e:
+                if not match_launch_resource_error(e):
+                    raise
+                for i, candidate in enumerate(fallbacks):
+                    log.warning(
+                        f"Kernel {self.kernel.name} failed to launch; trying "
+                        f"ranked fallback {i + 1}/{len(fallbacks)}"
+                    )
+                    try:
+                        compiled = self.compile_config(candidate)
+                        result = compiled(*args)
+                    except Exception as inner:
+                        if not match_launch_resource_error(inner):
+                            raise
+                        continue
+                    # Keep the working config so later calls skip the retry,
+                    # but stay wrapped in the untried candidates: this
+                    # BoundKernel is shared across shapes, so a config that
+                    # launches for this one may still fail for the next.
+                    self._run = self._run_with_fallbacks(compiled, fallbacks[i + 1 :])
+                    self._config = candidate
+                    counters["best_config_decorator"][
+                        self.format_kernel_decorator(candidate, self.settings)
+                    ] = 1
+                    return result
+                raise
+
+        return run_with_fallbacks
 
     def _specialize_extra(self) -> list[Callable[[Sequence[object]], Hashable]]:
         """
